@@ -9,6 +9,9 @@
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+#include <linux/kobject.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/of_platform.h>
 #include <linux/power_supply.h>
 #include <linux/sched/clock.h>
@@ -101,6 +104,11 @@ struct oplus_gki_device {
 	int soc;
 	int batt_fcc;
 	int batt_rm;
+	atomic64_t battery_discharge_energy_uws;
+	int energy_last_rm;
+	int energy_last_mv;
+	u64 energy_last_ms;
+	bool energy_last_valid;
 	int pre_batt_status;
 	int batt_status;
 	int batt_status_keep;
@@ -142,6 +150,58 @@ struct oplus_gki_device {
 #define RETRY_RETENTION_STATE	100
 
 static struct oplus_gki_device *g_gki_dev;
+static struct kobject *battery_energy_kobj;
+
+static ssize_t battery_discharge_energy_uws_show(struct kobject *kobj,
+						 struct kobj_attribute *attr, char *buf)
+{
+	struct oplus_gki_device *chip = READ_ONCE(g_gki_dev);
+
+	if (!chip)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%lld\n",
+			  (long long)atomic64_read(&chip->battery_discharge_energy_uws));
+}
+
+static struct kobj_attribute battery_discharge_energy_uws_attr =
+	__ATTR_RO(battery_discharge_energy_uws);
+
+static void oplus_gki_account_battery_discharge(struct oplus_gki_device *chip)
+{
+	u64 now_ms = div_u64(ktime_get_boottime_ns(), NSEC_PER_MSEC);
+	int rm = chip->batt_rm;
+	int mv = chip->vbat_mv;
+
+	/* A new discharge interval needs a fresh gauge baseline. */
+	if (rm <= 0 || mv < 2500 || mv > 5000 ||
+	    chip->batt_status != POWER_SUPPLY_STATUS_DISCHARGING ||
+	    chip->wired_online || chip->wls_online) {
+		chip->energy_last_valid = false;
+		return;
+	}
+
+	if (chip->energy_last_valid && rm < chip->energy_last_rm) {
+		u64 elapsed_ms = now_ms - chip->energy_last_ms;
+		u64 max_delta_mah = div_u64(20000ULL * elapsed_ms, 3600000) + 10;
+		int delta_mah = chip->energy_last_rm - rm;
+
+		if (delta_mah <= max_delta_mah) {
+			u64 average_mv = (chip->energy_last_mv + mv) / 2;
+			u64 energy_uws = (u64)delta_mah * average_mv * 3600;
+
+			atomic64_add(energy_uws, &chip->battery_discharge_energy_uws);
+		} else {
+			chg_err("ignore implausible gauge RM drop: %d mAh in %llu ms\n",
+				delta_mah, elapsed_ms);
+		}
+	}
+
+	chip->energy_last_rm = rm;
+	chip->energy_last_mv = mv;
+	chip->energy_last_ms = now_ms;
+	chip->energy_last_valid = true;
+}
 
 __maybe_unused static bool
 is_chg_disable_votable_available(struct oplus_gki_device *chip)
@@ -1039,6 +1099,7 @@ static void oplus_gki_gauge_update_work(struct work_struct *work)
 	oplus_mms_get_item_data(chip->gauge_topic, GAUGE_ITEM_RM, &data,
 				false);
 	chip->batt_rm = data.intval;
+	oplus_gki_account_battery_discharge(chip);
 	oplus_mms_get_item_data(chip->gauge_topic, GAUGE_ITEM_TEMP, &data,
 				false);
 	chip->temperature = data.intval;
@@ -2120,6 +2181,19 @@ static __init int oplus_chg_gki_init(void)
 		return -ENOMEM;
 	}
 	g_gki_dev = gki_dev;
+	atomic64_set(&gki_dev->battery_discharge_energy_uws, 0);
+	battery_energy_kobj = kobject_create_and_add("oplus_battery_energy", kernel_kobj);
+	if (battery_energy_kobj) {
+		int rc = sysfs_create_file(battery_energy_kobj,
+					   &battery_discharge_energy_uws_attr.attr);
+		if (rc < 0) {
+			chg_err("failed to expose discharge energy: rc=%d\n", rc);
+			kobject_put(battery_energy_kobj);
+			battery_energy_kobj = NULL;
+		}
+	} else {
+		chg_err("failed to create battery energy sysfs directory\n");
+	}
 
 	node = of_find_node_by_path("/soc/oplus_chg_core");
 	if (node == NULL)
@@ -2159,6 +2233,13 @@ static __exit void oplus_chg_gki_exit(void)
 {
 	if (g_gki_dev == NULL)
 		return;
+
+	if (battery_energy_kobj) {
+		sysfs_remove_file(battery_energy_kobj,
+				  &battery_discharge_energy_uws_attr.attr);
+		kobject_put(battery_energy_kobj);
+		battery_energy_kobj = NULL;
+	}
 
 	if (g_gki_dev->batt_psy)
 		power_supply_unregister(g_gki_dev->batt_psy);
